@@ -542,7 +542,10 @@ def main():
         info = proc.getSnapshotForApplication(proc.getMyApplHandle())
         pprint(info)
         
-        rs = proc.query("select * from syscat.tables fetch first 10 rows only")
+        rs = proc.query("select TABSCHEMA,TABNAME,CARD \
+        from syscat.tables \
+        where TABSCHEMA like 'SYS%' \
+        fetch first 10 rows only")
         pprint(rs)
     finally:
         proc.close()
