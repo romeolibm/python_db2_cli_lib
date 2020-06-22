@@ -2,8 +2,11 @@
     @author: Romeo Lupascu
     @contact: romeol@ca.ibm.com
     @organization: IBM
-    @since: 2020-06-18
- 
+    @since: 2020-06-18,2020-06-22
+    @license: http://www.apache.org/licenses/LICENSE-2.0
+    @version: 0.1
+    @see: https://github.com/romeolibm/python_db2_cli_lib
+    
      A small python library of methods and classes you can use
      to execute db2 queries and commands via the db2/db2pd cli interface.
      
@@ -13,9 +16,8 @@
      driver library or some information is only available to you 
      from the db2 cli interface. 
  
-     TODO: Error handling! (this is an alpha version for now)
 """
-import os, sys, subprocess, threading, re, StringIO, time
+import os, sys, subprocess, threading, re, StringIO, time, traceback
 import logging
 LGR = logging.getLogger("main")
 LOG_LEVELS = {
@@ -187,20 +189,37 @@ class TextIOProcessor(threading.Thread):
                 
                 if c == self.eol:
                     if self.linehandler:
-                        self.linehandler(self.line.getvalue())
+                        try:
+                            self.linehandler(self.line.getvalue())
+                        except Exception, e:
+                            LGR.debug("<>{0}".format(s))
+                            LGR.debug("lh-err:{0}".format(traceback.format_exc()))
+                    # TODO: use an array or buffer instead
                     self.line = StringIO.StringIO()
-                    # self.line.truncate()
                 else:
                     self.line.write(c)
                     s = self.line.getvalue()
-                    if self.inflightLineHandler and self.inflightLineHandler(s):
-                        LGR.debug(">>>{0}".format(s))
-                        self.line = StringIO.StringIO()
+                    try:
+                        if self.inflightLineHandler and self.inflightLineHandler(s):
+                            LGR.debug(">>>{0}".format(s))
+                            self.line = StringIO.StringIO()
+                    except Exception, e:
+                        LGR.debug("<<>{0}".format(s))
+                        LGR.debug("plh-err:{0}".format(traceback.format_exc()))
                         
                 self.__writeOutput(c)
         finally:
             LGR.debug("***Ending thread:{0}".format(self.name))
-            
+
+class TextRequestResponseSubprocessException(StandardError):
+    """
+    A base exception for all process response detected errors.
+    Those errors are expected to be raised by the _errParser()
+    method when processign the response from the child process.
+    """
+    def __init__(self, *args):
+        StandardError.__init__(self, *args)
+        
 class TextRequestResponseSubprocess:
     """
     A base class implementing the common algorithm for executing 
@@ -222,6 +241,7 @@ class TextRequestResponseSubprocess:
         self.responseParser = responseParser
         self.cmdline = cmdline
         self.endRequest = False
+        self.stdoutErr = False
         self.response = []
         
         LGR.debug("Exec process cmd:{0}".format(repr(cmdline)))
@@ -255,7 +275,17 @@ class TextRequestResponseSubprocess:
             start = time.time()
             while not self.endRequest and ((time.time() - start) < timeout):
                 time.sleep(0.2)
-    
+
+    def testForErrorState(self, line):
+        """
+        Some processes output error messages into the stdount instead of stderr.
+        This method is called first for each stdout line and can switch
+        the normal stdout line processing to the self.error line list.
+        It must be redefined in a derived class.
+        It must return true if an error start message was detected.
+        """
+        return False
+        
     def isAlive(self):
         return self.proc.poll() is None
     
@@ -266,10 +296,24 @@ class TextRequestResponseSubprocess:
     
     def handleOutputLine(self, line):
         LGR.debug(">>{0}".format(line))
+        if self.stdoutErr:
+            self.handleErrorLine(line)
+            return        
+        if self.testForErrorState(line):
+            self.stdoutErr = True
+            self.handleErrorLine(line)
+            return
+         
         if self.responseLineHandler:
             self.responseLineHandler(line)
         else:
-            self.response.append(line)
+            rt = type(self.response)
+            if rt == list:
+                self.response.append(line)
+            elif (rt == dict) \
+              and self.response.has_key('info') \
+              and (type(self.response['info']) == list):
+                self.response['info'].append(line)
         
     def handleErrorLine(self, line):
         self.error.append(line)
@@ -281,12 +325,17 @@ class TextRequestResponseSubprocess:
         """
         return self.responseParser(self.response) if self.responseParser else self.response 
     
-    def errParser(self):
+    def _errParser(self):
         """
         Override in derived class to allow you to parse the stderr from the 
-        process and present it ina structured object (whatever that is)
+        process and present it in a structured object (whatever that is).
+        By default this method is expected to raise an error derived from
+        TextRequestResponseSubprocessException but it can be redefined
+        to return an error object if the caller is able to distinguish
+        error objects from normal response objects.
         """
-        
+        raise TextRequestResponseSubprocessException(*self.error)
+    
     def getResponse(self, cmd, timeout=300, loopSleep=0.2):
         """
         Execute a request to the child thread listen/wait for a response on the
@@ -299,6 +348,7 @@ class TextRequestResponseSubprocess:
         self.endRequest = False
         if self.response is None:
             self.response = []
+        self.stdoutErr = False
         self.error = []
         
         LGR.debug("<<<{0}".format(str(cmd)))
@@ -312,6 +362,8 @@ class TextRequestResponseSubprocess:
             time.sleep(loopSleep)
             if (time.time() - stime) > timeout:
                 raise Exception("Timeout")
+        if self.error:
+            return self._errParser()
         return self._outputParser()
     
     def close(self):
@@ -319,13 +371,29 @@ class TextRequestResponseSubprocess:
             self.stdoutproc.close()
         if self.stderrproc:
             self.stderrproc.close()
-        
+
+class SQLError(TextRequestResponseSubprocessException):
+    def __init__(self, *args, **names):
+        TextRequestResponseSubprocessException.__init__(self, *args)
+        self.sqlCode = names.get('sqlCode', None)
+        self.sqlState = names.get('sqlState', None)
+    
+    def __repr__(self):
+        return "SQLError(sqlCode={0},sqlState={1},args={2})".format(
+            self.sqlCode, self.sqlState, self.args
+        )
+    def __str__(self):
+        return repr(self)
+    
 class DB2CliSubprocess(TextRequestResponseSubprocess):
     """
     Call a db2 command then execute subsequent commands parse and 
     return results to the caller.
     """
     QUERY_HDR_REC = re.compile("^-+(\s+-*)*$")
+    ERROR_LINE_REC = re.compile("^SQL\d+N.*$", re.DOTALL)
+    ERROR_CODE_REC = re.compile("SQL\d+N")
+    ERROR_STATE_REC = re.compile("SQLSTATE\=\d+")
             
     def __init__(self, database=None, delimiter="@"):
         self.delimiter = delimiter
@@ -341,6 +409,37 @@ class DB2CliSubprocess(TextRequestResponseSubprocess):
         
     def __promptDetector(self, line):
         return line == "db2 => "
+    
+    def testForErrorState(self, line):
+        """
+        Detect if this line is the start of an error message as 
+        a SQLnnnnN ...pattern        
+        """
+        return DB2CliSubprocess.ERROR_LINE_REC.match(line)
+    
+    def _errParser(self):
+        """
+        Extract the SQL error number and SQL state from the message.
+        """
+        sqlCode = None
+        sqlState = None
+        for line in self.error:
+            if not sqlCode:
+                m = DB2CliSubprocess.ERROR_CODE_REC.search(line)
+                if m:
+                    sqlCode = -int(m.group()[3:-1])
+            if not sqlState:
+                m = DB2CliSubprocess.ERROR_STATE_REC.search(line)
+                if m:
+                    sqlState = m.group()[9:]
+            
+            if sqlCode and sqlState:
+                break
+        
+        err = SQLError(sqlCode=sqlCode, sqlState=sqlState, *self.error)
+        if self.returError:
+            return err
+        raise err
     
     def handleQueryOutputLine(self, line):
         """
@@ -436,29 +535,51 @@ class DB2CliSubprocess(TextRequestResponseSubprocess):
             self.row_size = None
             self.last_line = None
             self.rowWriter = rowWriter
-            self.response = {'rows':rowReader if rowReader else []}
+            self.returError = False
+            self.response = {'rows':rowReader if rowReader else [], 'info':[]}
             return self.getResponse(sql + self.delimiter)
         finally:
             self.responseParser = None
             self.responseLineHandler = None
             
-    def execStmt(self, sql, responseParser=None, responseLineHandler=None, useDelim=True):
+    def execStmt(self,
+            sql,
+            responseParser=None,
+            responseLineHandler=None,
+            useDelim=True,
+            returError=False,
+            responseObject=None
+        ):
         """
         Execute and db2 statement or command that does not return any result sets.
         """
         try:
+            self.returError = returError
             self.responseParser = responseParser
             self.responseLineHandler = responseLineHandler
+            if not responseObject is None:
+                self.response = responseObject
+            else:
+                self.response = []
             return self.getResponse(sql + (self.delimiter if useDelim else ""))
         finally:
             self.responseParser = None
             self.responseLineHandler = None
      
-    def execCmd(self, sql, responseParser=None, responseLineHandler=None):
+    def execCmd(self,
+            sql,
+            responseParser=None,
+            responseLineHandler=None,
+            responseObject=None
+        ):
         """
         Execute and db2 command that does not return any result sets.
         """
-        return self.execStmt(sql, responseParser, responseLineHandler)
+        return self.execStmt(sql,
+            responseParser,
+            responseLineHandler,
+            responseObject=responseObject
+        )
      
     def getMyApplHandle(self):
         """
@@ -481,10 +602,10 @@ class DB2CliSubprocess(TextRequestResponseSubprocess):
         for ah in appl_handle:
             self.rsState = 'start'
             self.section = None
-            self.response = {}
             rl.append(self.execCmd(
                 "get snapshot for application agentid " + str(ah),
-                responseLineHandler=self.handleApplicationSnapshotLine
+                responseLineHandler=self.handleApplicationSnapshotLine,
+                responseObject={}
             ))
         return rl if len(rl) > 1 else rl[0]
         
@@ -514,19 +635,28 @@ class DB2pdSubprocess(TextRequestResponseSubprocess):
     Call a db2pd command then execute subsequent commands parse and 
     return results to the caller.
     """
-    def __promptDetector(self, line):
-        return line == "db2pd> "
-    
-    def __parseResponse(self, replay):
-        pass
+    ERROR_LINE_REC = re.compile("^Invalid\s+command.*$")
     
     def __init__(self):
         TextRequestResponseSubprocess.__init__(self,
-            ["db2"],
+            ["db2pd"],
             self.__promptDetector,
             self.__parseResponse
         )
+    
+    def testForErrorState(self, line):
+        """
+        Detect if this line is the start of an error message as 
+        a SQLnnnnN ...pattern        
+        """
+        return DB2pdSubprocess.ERROR_LINE_REC.matches(line)
 
+    def __promptDetector(self, line):
+        return line == "db2pd> "
+    
+    def getLatches(self):
+        """
+        """
     
 def main():
     """    
@@ -539,14 +669,41 @@ def main():
     try:
         proc.connect()
         
+        # DDL, DML and query
+        rc = proc.execStmt("""CREATE TABLE TEST_SCH.TEST_TBL 
+(
+    cname varchar(128),
+    value varchar(256)
+)
+        """, returError=True)
+        LGR.debug("Result:> {0}".format(rc))
+        
+        rc = proc.execStmt("""INSERT INTO TEST_SCH.TEST_TBL (cname,value) VALUES
+('n1','v1'),
+('n2','v2'),
+('n3','v3'),
+('n4','v4')
+        """, returError=True)
+        LGR.debug("Result:> {0}".format(rc))
+        
+        rs = proc.query("select * FROM TEST_SCH.TEST_TBL order by 1")
+        LGR.debug("Result:{0}".format(repr(rs)))
+        
+        rc = proc.execStmt('DROP TABLE TEST_SCH.TEST_TBL', returError=True)
+        LGR.debug("Result:> {0}".format(rc))
+        
+        # error handling
+        try:
+            rs = proc.query("select * from TEST_SCH.TEST_TBL")
+            pprint(rs)
+        except Exception, e:
+            LGR.debug("!!!! Error:> {0}".format(traceback.format_exc()))
+            # pprint(e)
+            
+        # using cli utilities
         info = proc.getSnapshotForApplication(proc.getMyApplHandle())
         pprint(info)
         
-        rs = proc.query("select TABSCHEMA,TABNAME,CARD \
-        from syscat.tables \
-        where TABSCHEMA like 'SYS%' \
-        fetch first 10 rows only")
-        pprint(rs)
     finally:
         proc.close()
         
